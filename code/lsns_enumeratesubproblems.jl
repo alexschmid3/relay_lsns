@@ -9,95 +9,7 @@ end
 
 #-------------------------------------------------------------------------#
 
-function restoredriverarcsets()
-
-	traveltime = cacheShortestTravelTimes(numlocs, prearcs, "rdd time")
-	homeArcSet, homeArcSet_space, availableDrivers, A_plus_d, A_minus_d = Dict(), Dict(), Dict(), Dict(), Dict()
-	fullhourlist = [t for t in 0:tstep:horizon-tstep]
-
-	for d in drivers
-		homeArcSet[d] = []
-		homeArcSet_space[d] = []
-	end
-	for a in 1:numarcs
-		availableDrivers[a] = []
-	end
-	for d in drivers, n in 1:numnodes
-		A_plus_d[d,n] = []
-		A_minus_d[d,n] = []
-	end
-
-	prearcs_aug = deepcopy(prearcs)
-	for l in 1:numlocs
-		push!(prearcs_aug, (l, l, tstep, tstep))
-	end
-
-	closelocs = Dict()
-	for d in drivers
-		closelocs[d] = []
-	end
-
-	for d in drivers, arc in prearcs_aug
-		#Travel times between all relevant locations
-		orig, dest = arc[1], arc[2]
-		h = driverHomeLocs[d]
-		t1 = traveltime[h, orig]
-		t2 = arc[3]
-		t3 = traveltime[dest, h]
-
-		#Check earliest we can get to the arc origin location from our current location
-		driverstartingloc, driverstartingtime = driverHomeLocs[d], 0
-		firstshifttime = setdiff(fullhourlist, T_off[drivershift[d]])[1]
-		drivinghourstoarcorig = traveltime[driverstartingloc, orig]
-		totalhourstoarcorig = floor(drivinghourstoarcorig/shiftlength) * (24 - shiftlength) + drivinghourstoarcorig
-		earliesttime = totalhourstoarcorig + max(firstshifttime, driverstartingtime)
-
-		#If the arc is feasible for the driver, add it to the driver's arc list
-		if ((t1 + t2 <= shiftlength) & (t3 <= shiftlength)) || ((t1 <= shiftlength) & (t2 + t3 <= shiftlength))
-			if !(orig in closelocs[d])
-				push!(closelocs[d], orig)
-			end
-			if !(dest in closelocs[d])
-				push!(closelocs[d], dest)
-			end
-
-			for t in setdiff([t4 for t4 in fullhourlist if t4 >= earliesttime], T_off[drivershift[d]])
-				#Arc must finish before the end of the horizon and before the "next" off hour of the driver
-				if t + t2 <= [t4 for t4 in union(T_off[drivershift[d]], horizon) if t4 > t][1]
-					push!(homeArcSet[d], arcs[nodes[orig, t], nodes[dest, t + t2]])
-					if orig != dest
-						push!(homeArcSet_space[d], arcs[nodes[orig, t], nodes[dest, t + t2]])
-					end				
-					push!(availableDrivers[arcs[nodes[orig, t], nodes[dest, t + t2]]], d)
-				end
-			end
-		end
-	end
-
-	#Add stay-at-home arcs for driver's off hours
-	for d in drivers, t in setdiff(T_off[drivershift[d]], [horizon]), l in closelocs[d]
-		push!(homeArcSet[d], arcs[nodes[l, t], nodes[l, t + tstep]])
-		push!(availableDrivers[arcs[nodes[l, t], nodes[l, t + tstep]]], d)
-	end
-
-	#Create A_plus and A_minus lists
-	for d in drivers, n in 1:numnodes, a in A_plus[n]
-		if a in homeArcSet[d]
-			push!(A_plus_d[d,n], a)
-		end
-	end
-	for d in drivers, n in 1:numnodes, a in A_minus[n]
-		if a in homeArcSet[d]
-			push!(A_minus_d[d,n], a)
-		end
-	end
-
-	return homeArcSet, homeArcSet_space, availableDrivers, A_plus_d, A_minus_d, closelocs
-
-end
-
-#-------------------------------------------------------------------------#
-
+#Format found heuristic solution and prepare for breaking down by subproblem
 function getinitialsolution(pastordersegments, pastdriversegments, pasttaxisegments, pastemptysegments, orderdelayoutcomes)
 
 	x_currsol, y_currsol, z_currsol, w_currsol, ordtime_currsol = Dict(), Dict(), Dict(), Dict(), Dict()
@@ -154,27 +66,7 @@ end
 
 #-------------------------------------------------------------------------#
 
-#Enumerates all location clusters of size k (for k in locationgroupsizes), by centering one group at each location
-function findlocationgroups_knn(locationgroupsizes)
-
-	locationgroups = []
-
-	kdtree = KDTree(transpose(hubCoords))
-
-	for l in 1:numlocs, k in locationgroupsizes
-		idxs, dists = knn(kdtree, hubCoords[l,:], k, true)
-		if !(idxs in locationgroups) 
-			push!(locationgroups, idxs)
-		end
-	end
-	
-	return locationgroups
-
-end
-
-#-------------------------------------------------------------------------#
-
-#Enumerates all location clusters by finding the set of adjacent locations for each location
+#Enumerates all possible location clusters for subproblems by finding the set of adjacent locations for each location
 function findlocationgroups_adjacency()
 
 	locationgroups = []
@@ -191,6 +83,26 @@ function findlocationgroups_adjacency()
 		end
 	end
 
+	return locationgroups
+
+end
+	
+#-------------------------------------------------------------------------#
+	
+#Enumerates all location clusters of size k (for k in locationgroupsizes), by centering one group at each location --> COULD USE THIS VERSION INSTEAD?
+function findlocationgroups_knn(locationgroupsizes)
+
+	locationgroups = []
+
+	kdtree = KDTree(transpose(hubCoords))
+
+	for l in 1:numlocs, k in locationgroupsizes
+		idxs, dists = knn(kdtree, hubCoords[l,:], k, true)
+		if !(idxs in locationgroups) 
+			push!(locationgroups, idxs)
+		end
+	end
+	
 	return locationgroups
 
 end
@@ -212,6 +124,7 @@ end
 
 #-------------------------------------------------------------------------#
 
+#Find the region of the time-space network corresponding to a specific subproblem
 function maptosubproblem_ntwk(subprob)
 
 	subprobNodeSet, subprobArcSet, sp_times, timeblockArcSet = [], [], [], []
@@ -249,6 +162,7 @@ end
 
 #-------------------------------------------------------------------------#
 
+#Find the orders flowing through a subproblem, along with start and end locations within the subproblem
 function maptosubproblem_orders(subprobArcSet, timeblockArcSet, x_currpath, sp_times)
 
 	excludearcs = setdiff(timeblockArcSet, subprobArcSet)
@@ -304,7 +218,7 @@ end
 
 #-------------------------------------------------------------------------#
 
-#Calculate the truck flow supply/demand at each node
+#Calculate the truck flow supply/demand at each node for a given subproblem
 function maptosubproblem_trucks(sp_orders, subprobNodeSet, subprobArcSet, timeblockArcSet, x_currsol, y_currsol)
 
 	sp_trucksupply = Dict()
@@ -351,6 +265,7 @@ end
 
 #-------------------------------------------------------------------------#
 
+#Find the available drivers and corresponding start and end locations for a given subproblem
 function maptosubproblem_drivers(subprob, z_currpath, timeblockArcSet, subprobNodeSet, subprobArcSet)
 
 	sp_drivers, sp_drivers_home = [], []
@@ -398,6 +313,7 @@ end
 
 #-------------------------------------------------------------------------#
 
+#Solve a subproblem using Gurobi to find the objective improvement
 function solvesubproblem_lsns(subprobArcSet, subprobNodeSet, sp_orders, sp_drivers, sp_times, sp_compl_orders, sp_ordersinprogress, sp_Origin, sp_Destination, sp_containsextended, sp_trucksupply, sp_driversupply, x_currsol, y_currsol, z_currsol, w_currsol, ordtime_currsol, outsideorderdemand, sp_drivers_home)
 
 	m = Model(Gurobi.Optimizer)
@@ -512,6 +428,7 @@ end
 
 #-------------------------------------------------------------------------#
 
+#Write subproblem data to csv - NEED TO ADD ALL FEATURES WE WANT TO SAVE HERE!
 function writeresults_subproblemdata(filename, improvementlist, improvementpctlist, solvetimelist, timewindowlist, numlocslist, numorderslist)
 	
 	numsp = length(improvementlist)
@@ -531,8 +448,98 @@ end
 
 #-------------------------------------------------------------------------#
 
-#=
+#Use to get the available arcs for each driver before decomposing into subproblems
+function restoredriverarcsets()
 
+	traveltime = cacheShortestTravelTimes(numlocs, prearcs, "rdd time")
+	homeArcSet, homeArcSet_space, availableDrivers, A_plus_d, A_minus_d = Dict(), Dict(), Dict(), Dict(), Dict()
+	fullhourlist = [t for t in 0:tstep:horizon-tstep]
+
+	for d in drivers
+		homeArcSet[d] = []
+		homeArcSet_space[d] = []
+	end
+	for a in 1:numarcs
+		availableDrivers[a] = []
+	end
+	for d in drivers, n in 1:numnodes
+		A_plus_d[d,n] = []
+		A_minus_d[d,n] = []
+	end
+
+	prearcs_aug = deepcopy(prearcs)
+	for l in 1:numlocs
+		push!(prearcs_aug, (l, l, tstep, tstep))
+	end
+
+	closelocs = Dict()
+	for d in drivers
+		closelocs[d] = []
+	end
+
+	for d in drivers, arc in prearcs_aug
+		#Travel times between all relevant locations
+		orig, dest = arc[1], arc[2]
+		h = driverHomeLocs[d]
+		t1 = traveltime[h, orig]
+		t2 = arc[3]
+		t3 = traveltime[dest, h]
+
+		#Check earliest we can get to the arc origin location from our current location
+		driverstartingloc, driverstartingtime = driverHomeLocs[d], 0
+		firstshifttime = setdiff(fullhourlist, T_off[drivershift[d]])[1]
+		drivinghourstoarcorig = traveltime[driverstartingloc, orig]
+		totalhourstoarcorig = floor(drivinghourstoarcorig/shiftlength) * (24 - shiftlength) + drivinghourstoarcorig
+		earliesttime = totalhourstoarcorig + max(firstshifttime, driverstartingtime)
+
+		#If the arc is feasible for the driver, add it to the driver's arc list
+		if ((t1 + t2 <= shiftlength) & (t3 <= shiftlength)) || ((t1 <= shiftlength) & (t2 + t3 <= shiftlength))
+			if !(orig in closelocs[d])
+				push!(closelocs[d], orig)
+			end
+			if !(dest in closelocs[d])
+				push!(closelocs[d], dest)
+			end
+
+			for t in setdiff([t4 for t4 in fullhourlist if t4 >= earliesttime], T_off[drivershift[d]])
+				#Arc must finish before the end of the horizon and before the "next" off hour of the driver
+				if t + t2 <= [t4 for t4 in union(T_off[drivershift[d]], horizon) if t4 > t][1]
+					push!(homeArcSet[d], arcs[nodes[orig, t], nodes[dest, t + t2]])
+					if orig != dest
+						push!(homeArcSet_space[d], arcs[nodes[orig, t], nodes[dest, t + t2]])
+					end				
+					push!(availableDrivers[arcs[nodes[orig, t], nodes[dest, t + t2]]], d)
+				end
+			end
+		end
+	end
+
+	#Add stay-at-home arcs for driver's off hours
+	for d in drivers, t in setdiff(T_off[drivershift[d]], [horizon]), l in closelocs[d]
+		push!(homeArcSet[d], arcs[nodes[l, t], nodes[l, t + tstep]])
+		push!(availableDrivers[arcs[nodes[l, t], nodes[l, t + tstep]]], d)
+	end
+
+	#Create A_plus and A_minus lists
+	for d in drivers, n in 1:numnodes, a in A_plus[n]
+		if a in homeArcSet[d]
+			push!(A_plus_d[d,n], a)
+		end
+	end
+	for d in drivers, n in 1:numnodes, a in A_minus[n]
+		if a in homeArcSet[d]
+			push!(A_minus_d[d,n], a)
+		end
+	end
+
+	return homeArcSet, homeArcSet_space, availableDrivers, A_plus_d, A_minus_d, closelocs
+
+end
+
+#-------------------------------------------------------------------------#
+
+#=
+#Will need if we implement actual large-scale neighborhood search
 function updatesolution(x_found, y_found, z_found, w_found, obj_found)
 
 	
